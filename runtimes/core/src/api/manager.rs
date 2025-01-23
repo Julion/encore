@@ -6,7 +6,7 @@ use anyhow::Context;
 
 use crate::api::auth::{LocalAuthHandler, RemoteAuthHandler};
 use crate::api::call::ServiceRegistry;
-use crate::api::gateway::Gateway;
+use crate::api::gateway::GatewayServer;
 use crate::api::http_server::HttpServer;
 use crate::api::paths::Pather;
 use crate::api::reqauth::platform;
@@ -22,6 +22,7 @@ use crate::trace::Tracer;
 use crate::{api, model, pubsub, secrets, EncoreName, EndpointName, Hosted};
 
 use super::encore_routes::healthz;
+use super::gateway::Gateway;
 use super::websocket_client::WebSocketClient;
 use super::ResponsePayload;
 
@@ -55,7 +56,7 @@ pub struct Manager {
     api_server: Option<server::Server>,
     runtime: tokio::runtime::Handle,
 
-    gateways: HashMap<EncoreName, Gateway>,
+    gateway_server: Option<GatewayServer>,
     testing: bool,
 }
 
@@ -146,14 +147,22 @@ impl ManagerConfig<'_> {
                     .get(rid)
                     .map(|gw| (gw.encore_name.as_str(), gw))
             }));
-        let mut gateways = HashMap::new();
-        let routes = paths::compute(
-            endpoints
-                .iter()
-                .map(|(_, ep)| RoutePerService(ep.to_owned())),
-        );
 
         let mut auth_data_schemas = HashMap::new();
+        let mut gateway_server = GatewayServer::new(
+            service_registry.clone(),
+            healthz_handler.clone(),
+            own_api_address,
+            self.proxied_push_subs.clone(),
+            self.platform_validator.clone(),
+        );
+
+        // toggle pre multi-gateway behaviour TODO this needs to be configurable
+        let legacy_mode =
+            self.meta.gateways.len() == 1 && self.meta.gateways[0].encore_name == "api-gateway";
+
+        // TODO configure internal gateway for non-legacy mode
+
         for gw in &self.meta.gateways {
             let Some(gw_cfg) = hosted_gateways.get(gw.encore_name.as_str()) else {
                 continue;
@@ -161,6 +170,14 @@ impl ManagerConfig<'_> {
             let Some(cors_cfg) = &gw_cfg.cors else {
                 anyhow::bail!("missing CORS configuration for gateway {}", gw.encore_name);
             };
+
+            let routes = paths::compute(
+                endpoints
+                    .iter()
+                    // TODO filter on routes that are exposed for this gateway only
+                    .filter(|(_, ep)| ep.exposed)
+                    .map(|(_, ep)| RoutePerService(ep.to_owned())),
+            );
 
             let auth_handler = build_auth_handler(
                 self.meta,
@@ -180,20 +197,38 @@ impl ManagerConfig<'_> {
                 auth_handler.as_ref().map(|ah| ah.auth_data().clone()),
             );
 
-            gateways.insert(
-                gw.encore_name.clone().into(),
-                Gateway::new(
+            // add an internal gateway with all paths to preserve legacy behaviour
+            if legacy_mode {
+                let routes = paths::compute(
+                    endpoints
+                        .iter()
+                        .map(|(_, ep)| RoutePerService(ep.to_owned())),
+                );
+                let auth_handler = build_auth_handler(
+                    self.meta,
+                    gw,
+                    &service_registry,
+                    self.http_client.clone(),
+                    self.tracer.clone(),
+                )
+                .context("unable to build authenticator")?;
+
+                gateway_server.set_internal_gateway(Gateway::new(
+                    "internal".into(),
+                    routes.clone(),
+                    auth_handler,
+                    cors_config.clone(),
+                )?);
+            }
+
+            gateway_server
+                .add_gateway(
                     gw.encore_name.clone().into(),
-                    service_registry.clone(),
                     routes.clone(),
                     auth_handler,
                     cors_config,
-                    healthz_handler.clone(),
-                    own_api_address,
-                    self.proxied_push_subs.clone(),
                 )
-                .context("couldn't create gateway")?,
-            );
+                .context("couldn't create gateway")?;
         }
 
         let api_server = if !hosted_services.is_empty() {
@@ -211,12 +246,18 @@ impl ManagerConfig<'_> {
             None
         };
 
+        let gateway_server = if self.meta.gateways.is_empty() {
+            None
+        } else {
+            Some(gateway_server)
+        };
+
         Ok(Manager {
             gateway_listen_addr,
             api_listener: Mutex::new(api_listener),
             service_registry,
             api_server,
-            gateways,
+            gateway_server,
             pubsub_push_registry: self.pubsub_push_registry,
             runtime: self.runtime,
             healthz: healthz_handler,
@@ -311,8 +352,10 @@ fn build_auth_handler(
 }
 
 impl Manager {
-    pub fn gateway(&self, name: &EncoreName) -> Option<&Gateway> {
-        self.gateways.get(name)
+    pub fn gateway(&self, name: &EncoreName) -> Option<&Arc<Gateway>> {
+        self.gateway_server
+            .as_ref()
+            .and_then(|gws| gws.get_gateway(name))
     }
 
     pub fn server(&self) -> Option<&server::Server> {
@@ -365,42 +408,43 @@ impl Manager {
         let server = HttpServer::new(encore_routes, api, fallback);
 
         let api_listener = self.api_listener.lock().unwrap().take();
+
+        let testing = self.testing;
+        let gateways = self.gateway_server.clone();
         let gateway_listener = self.gateway_listen_addr.clone();
 
-        // TODO handle multiple gateways
-        let gateway = self.gateways.values().next().cloned();
-        let testing = self.testing;
-
         self.runtime.spawn(async move {
-            let gateway_parts = (gateway, gateway_listener);
+            let gateway_parts = (gateways, gateway_listener);
             let gateway_fut = match gateway_parts {
-                (Some(gw), Some(ref ln)) => {
-                    if !testing {
-                        log::debug!(addr=ln; "gateway listening for incoming requests");
-                        Some(gw.serve(ln))
-                    } else {
-                        // No need running the gateway in tests
+                (Some(gws), Some(ref ln)) => {
+                    if testing {
+                        // No need to run gateway server in tests
                         None
+                    } else {
+                        log::debug!(ln = ln; "gateway listening for incoming requests");
+                        Some(gws.serve(ln))
                     }
                 },
                 (Some(_), None) => {
-                    ::log::error!("internal encore error: misconfigured api gateway (missing listener), skipping");
+                    log::error!("internal encore error: misconfigured gateway server (missing listener), skipping");
                     None
-                }
+                },
                 (None, Some(_)) => {
-                    ::log::error!("internal encore error: misconfigured api gateway (missing gateway config), skipping");
+                    log::error!("internal encore error: misconfigured gateway server (missing gateway config), skipping");
                     None
-                }
+                },
                 (None, None) => None,
             };
 
             let api_fut = match api_listener {
                 Some(ln) => {
-                    let addr = ln.local_addr().map(|addr| addr.to_string()).unwrap_or_default();
+                    let addr = ln
+                        .local_addr()
+                        .map(|addr| addr.to_string())
+                        .unwrap_or_default();
                     log::debug!(addr = addr; "api server listening for incoming requests");
 
-                    ln
-                        .set_nonblocking(true)
+                    ln.set_nonblocking(true)
                         .context("unable to set nonblocking")?;
                     let axum_listener = tokio::net::TcpListener::from_std(ln)
                         .context("unable to convert listener to tokio")?;
@@ -411,8 +455,8 @@ impl Manager {
             };
 
             tokio::select! {
-                res = async { gateway_fut.unwrap().await }, if gateway_fut.is_some() => {
-                    res.context("serve gateway").inspect_err(|err| log::error!("api gateway failed: {:?}", err))?;
+                res = async { gateway_fut.unwrap().await }, if gateway_fut.is_some()  => {
+                    res.context("gateway").inspect_err(|err| log::error!("gateway failed: {:?}", err))?;
                 },
                 res = async { api_fut.unwrap().await }, if api_fut.is_some() => {
                     res.context("serve api").inspect_err(|err| log::error!("api server failed: {:?}", err))?;
